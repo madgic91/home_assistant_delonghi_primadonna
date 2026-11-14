@@ -309,8 +309,6 @@ NARROW_RECIPE_TAGS = frozenset({
 RECIPE_METADATA_TAGS = frozenset({0x18, 0x19, 0x1B})
 # Accessory tag, sent last by Coffee Link.
 RECIPE_ACCESSORY_TAG = 0x1C
-# A single BLE write longer than this is ignored by the machine (#280).
-MAX_SINGLE_WRITE = 20
 
 
 def _build_recipe_read_command(profile: int, recipe_id: int) -> list[int]:
@@ -1124,14 +1122,7 @@ class DelongiPrimadonna:
                 recipe_id, profile,
             )
             return None
-        cmd = _build_recipe_start_command(recipe_id, ingredients, profile)
-        if len(cmd) > MAX_SINGLE_WRITE:
-            _LOGGER.warning(
-                "Start frame for recipe %d is %d bytes, longer than one "
-                "BLE write: the machine may ignore it (see #280)",
-                recipe_id, len(cmd),
-            )
-        return cmd
+        return _build_recipe_start_command(recipe_id, ingredients, profile)
 
     async def beverage_cancel(self) -> None:
         """Cancel beverage"""
