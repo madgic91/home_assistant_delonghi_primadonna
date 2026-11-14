@@ -48,6 +48,9 @@ _LOGGER = logging.getLogger(__name__)
 
 # Seconds between two status requests (0x75), see #287.
 STATUS_UPDATE_INTERVAL = 25
+# Longest a status request may take before it is abandoned, so a BLE call
+# that never returns cannot block every later poll.
+STATUS_UPDATE_TIMEOUT = 20
 
 
 class DeviceNotVisible(BleakError):
@@ -438,7 +441,9 @@ class DelongiPrimadonna:
         self._last_response: bytes | None = None
         # (profile, recipe id) -> ingredients read from the machine (0xa6)
         self.recipe_quantities: dict[tuple[int, int], list] = {}
-        self._recipe_event: asyncio.Event | None = None
+        # One pending read per (profile, recipe): replies are matched to
+        # the read waiting for them, never to a later one.
+        self._recipe_waiters: dict[tuple[int, int], asyncio.Future] = {}
         self.statistics: dict[int, int | float] = {}
         self._last_stats_request = 0.0
         self._stats_lock = asyncio.Lock()
@@ -446,7 +451,7 @@ class DelongiPrimadonna:
         self._last_switches_request = 0.0
         self._statistics_task: asyncio.Task | None = None
         self._status_task: asyncio.Task | None = None
-        self._last_status_request = 0.0
+        self._last_status_request: float | None = None
         self._initialization_task: asyncio.Task | None = None
         machine = get_machine_model(self.product_code)
         self.model = (
@@ -543,7 +548,8 @@ class DelongiPrimadonna:
             return
 
         if (
-            time.monotonic() - self._last_status_request
+            self._last_status_request is not None
+            and time.monotonic() - self._last_status_request
             < STATUS_UPDATE_INTERVAL
         ):
             return
@@ -557,7 +563,14 @@ class DelongiPrimadonna:
     async def _run_status_update(self) -> None:
         """Run a managed status update."""
         try:
-            await self.get_device_name()
+            await asyncio.wait_for(
+                self.get_device_name(), STATUS_UPDATE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "Status update took more than %s s, abandoned",
+                STATUS_UPDATE_TIMEOUT,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -888,19 +901,23 @@ class DelongiPrimadonna:
             self._handle_parameter_data(value)
         elif answer_id == 0xA6:
             recipe = _parse_recipe_quantity(bytes(value))
+            ingredients = None
             if recipe is None:
                 _LOGGER.warning(
                     "Could not parse recipe answer: %s", hexlify(value, " ")
                 )
+                key = (value[4], value[5]) if len(value) > 5 else None
             else:
                 profile, recipe_id, ingredients = recipe
-                self.recipe_quantities[(profile, recipe_id)] = ingredients
+                key = (profile, recipe_id)
+                self.recipe_quantities[key] = ingredients
                 _LOGGER.debug(
                     "Recipe %d (profile %d): %s",
                     recipe_id, profile, ingredients,
                 )
-            if self._recipe_event is not None:
-                self._recipe_event.set()
+            waiter = self._recipe_waiters.get(key)
+            if waiter is not None and not waiter.done():
+                waiter.set_result(ingredients)
 
         if (
             self._response_event is not None
@@ -1086,30 +1103,34 @@ class DelongiPrimadonna:
         self, recipe_id: int, profile: int | None = None,
         timeout: float = 3.0,
     ) -> list | None:
-        """Read the ingredients a recipe has on the machine (0xa6)."""
+        """Read the ingredients a recipe has on the machine (0xa6).
+
+        The timeout covers sending the request too. Only a reply that
+        arrives while this read waits for it is used.
+        """
         profile = profile or self.active_profile_id or 1
         key = (profile, recipe_id & 0xFF)
-        self.recipe_quantities.pop(key, None)
-        self._recipe_event = asyncio.Event()
+        waiter = self._recipe_waiters.get(key)
+        owner = waiter is None or waiter.done()
+        if owner:
+            self.recipe_quantities.pop(key, None)
+            waiter = asyncio.get_running_loop().create_future()
+            self._recipe_waiters[key] = waiter
+
+        async def read():
+            if owner:
+                await self.send_command(
+                    _build_recipe_read_command(profile, recipe_id)
+                )
+            return await asyncio.shield(waiter)
+
         try:
-            await self.send_command(
-                _build_recipe_read_command(profile, recipe_id)
-            )
-            deadline = time.monotonic() + timeout
-            while key not in self.recipe_quantities:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._recipe_event.clear()
-                try:
-                    await asyncio.wait_for(
-                        self._recipe_event.wait(), remaining
-                    )
-                except asyncio.TimeoutError:
-                    break
+            return await asyncio.wait_for(read(), timeout)
+        except asyncio.TimeoutError:
+            return None
         finally:
-            self._recipe_event = None
-        return self.recipe_quantities.get(key)
+            if owner and self._recipe_waiters.get(key) is waiter:
+                del self._recipe_waiters[key]
 
     async def _build_stored_recipe_start(self, recipe_id: int):
         """Build a start frame from the recipe stored on the machine."""
